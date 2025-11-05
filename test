@@ -1,0 +1,498 @@
+import React, { useEffect, useRef, useState } from "react";
+
+// Sorry Counter App (single-file React component)
+// This version adds explicit microphone permission diagnostics and user guidance when permission is denied.
+// - Detects microphone permission state (if Permissions API available)
+// - Shows clear instructions and a "Request microphone permission" button
+// - Keeps all previous debug helpers so you can simulate speech when mic is unavailable
+// - Defensive checks remain for SpeechRecognition
+
+export default function SorryCounterApp() {
+  const [listening, setListening] = useState(false);
+  const [enrolled, setEnrolled] = useState(false);
+  const enrolledRef = useRef(enrolled);
+  const [enrollStatus, setEnrollStatus] = useState("Not enrolled");
+  const [similarity, setSimilarity] = useState(0);
+  const [verified, setVerified] = useState(false);
+  const verifiedRef = useRef(verified);
+  const [count, setCount] = useState(0);
+  const [status, setStatus] = useState("Idle");
+  const [threshold, setThreshold] = useState(0.7);
+  const [micPermission, setMicPermission] = useState('unknown'); // 'granted' | 'denied' | 'prompt' | 'unknown'
+
+  const audioCtxRef = useRef(null);
+  const analyserRef = useRef(null);
+  const dataArrayRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const enrolVectorRef = useRef(null);
+  const rafRef = useRef(null);
+
+  const recognitionRef = useRef(null);
+  const lastTranscriptRef = useRef("");
+
+  // Sync refs with state so event handlers see latest values
+  useEffect(() => { enrolledRef.current = enrolled; }, [enrolled]);
+  useEffect(() => { verifiedRef.current = verified; }, [verified]);
+
+  // daily storage key
+  const getDateKey = () => {
+    const d = new Date();
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `sorry-counter-${yyyy}-${mm}-${dd}`;
+  };
+
+  useEffect(() => {
+    // Load today's count from localStorage
+    try {
+      const key = getDateKey();
+      const saved = localStorage.getItem(key);
+      setCount(saved ? parseInt(saved, 10) : 0);
+    } catch (e) {
+      console.warn('localStorage unavailable', e);
+      setCount(0);
+    }
+
+    // Check permission on mount
+    checkMicPermission();
+
+    // Cleanup on unmount
+    return () => stopAll();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    // persist whenever count changes
+    try { localStorage.setItem(getDateKey(), String(count)); } catch (e) {}
+  }, [count]);
+
+  // Check microphone permission using Permissions API if available
+  async function checkMicPermission() {
+    if (!navigator.permissions || !navigator.permissions.query) {
+      setMicPermission('unknown');
+      return;
+    }
+    try {
+      const status = await navigator.permissions.query({ name: 'microphone' });
+      const mapState = (s) => (s === 'granted' ? 'granted' : s === 'denied' ? 'denied' : 'prompt');
+      setMicPermission(mapState(status.state));
+      status.onchange = () => setMicPermission(mapState(status.state));
+    } catch (e) {
+      // Some browsers (or cross-origin contexts) may reject this call
+      setMicPermission('unknown');
+    }
+  }
+
+  // Start microphone and audio analyser
+  async function startMic() {
+    if (mediaStreamRef.current) return true;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus("getUserMedia not supported in this browser");
+      setMicPermission('denied');
+      return false;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+      audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioCtxRef.current.createMediaStreamSource(stream);
+      const analyser = audioCtxRef.current.createAnalyser();
+      analyser.fftSize = 2048; // good balance
+      source.connect(analyser);
+      analyserRef.current = analyser;
+      dataArrayRef.current = new Uint8Array(analyser.frequencyBinCount);
+      setStatus("Mic ready");
+      setMicPermission('granted');
+      return true;
+    } catch (e) {
+      console.error("startMic error", e);
+      // Distinguish common permission denial causes
+      const errMsg = (e && e.name) || (e && e.message) || '';
+      if (errMsg.toLowerCase().includes('notallowed') || errMsg.toLowerCase().includes('permission') || errMsg.toLowerCase().includes('denied')) {
+        setMicPermission('denied');
+        setStatus("Microphone access denied — please enable the microphone in your browser settings.");
+      } else {
+        setStatus("Microphone access denied or not available");
+      }
+      return false;
+    }
+  }
+
+  function stopMic() {
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+      mediaStreamRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      try { audioCtxRef.current.close(); } catch (e) {}
+      audioCtxRef.current = null;
+    }
+    analyserRef.current = null;
+    dataArrayRef.current = null;
+  }
+
+  function stopAll() {
+    stopMic();
+    stopRecognition();
+    try { cancelAnimationFrame(rafRef.current || 0); } catch (e) {}
+  }
+
+  // Create a simple spectrum vector fingerprint from the analyser
+  function readSpectrum() {
+    const analyser = analyserRef.current;
+    const dataArray = dataArrayRef.current;
+    if (!analyser || !dataArray) return null;
+    try {
+      analyser.getByteFrequencyData(dataArray); // fills dataArray
+    } catch (e) {
+      return null;
+    }
+    // downsample/normalize to fixed length vector (e.g. 128)
+    const targetLen = 128;
+    const out = new Float32Array(targetLen);
+    const step = Math.floor(dataArray.length / targetLen) || 1;
+    let maxVal = 1;
+    for (let i = 0; i < targetLen; i++) {
+      let sum = 0;
+      for (let j = 0; j < step; j++) {
+        sum += dataArray[i * step + j] || 0;
+      }
+      out[i] = sum / step;
+      if (out[i] > maxVal) maxVal = out[i];
+    }
+    // normalize
+    for (let i = 0; i < targetLen; i++) out[i] /= maxVal;
+    return out;
+  }
+
+  function cosineSimilarity(a, b) {
+    if (!a || !b || a.length !== b.length) return 0;
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      na += a[i] * a[i];
+      nb += b[i] * b[i];
+    }
+    if (na === 0 || nb === 0) return 0;
+    return dot / (Math.sqrt(na) * Math.sqrt(nb));
+  }
+
+  // Enrollment: record a short averaged vector
+  async function enrollSample(durationMs = 3000) {
+    setEnrollStatus("Starting enrollment — please speak naturally for a few seconds...");
+    const micOk = await startMic();
+    if (!micOk || !analyserRef.current) {
+      setEnrollStatus("Failed to access mic for enrollment");
+      return false;
+    }
+    // sample repeatedly over duration and average
+    const samples = [];
+    const start = performance.now();
+    return new Promise((resolve) => {
+      function loop() {
+        const vec = readSpectrum();
+        if (vec) samples.push(vec);
+        if (performance.now() - start < durationMs) {
+          rafRef.current = requestAnimationFrame(loop);
+        } else {
+          // average
+          if (samples.length === 0) {
+            setEnrollStatus("No audio captured — try again");
+            resolve(false);
+            return;
+          }
+          const L = samples[0].length;
+          const avg = new Float32Array(L);
+          for (let i = 0; i < samples.length; i++) {
+            for (let j = 0; j < L; j++) avg[j] += samples[i][j];
+          }
+          for (let j = 0; j < L; j++) avg[j] /= samples.length;
+          enrolVectorRef.current = avg;
+          setEnrolled(true);
+          setEnrollStatus("Enrolled — saved voice fingerprint (approximate)");
+          resolve(true);
+        }
+      }
+      loop();
+    });
+  }
+
+  // Live verification loop: continuously compute similarity and update `verified` when above threshold
+  function startVerificationLoop() {
+    if (!analyserRef.current || !enrolVectorRef.current) return;
+    function loop() {
+      const vec = readSpectrum();
+      if (vec && enrolVectorRef.current) {
+        const sim = cosineSimilarity(vec, enrolVectorRef.current);
+        setSimilarity(sim);
+        const ok = sim >= threshold;
+        setVerified(ok);
+      }
+      rafRef.current = requestAnimationFrame(loop);
+    }
+    // Cancel any existing loop
+    try { cancelAnimationFrame(rafRef.current || 0); } catch (e) {}
+    loop();
+  }
+
+  // Speech recognition setup
+  function browserSupportsSpeechRecognition() {
+    return !!(window && (window.SpeechRecognition || window.webkitSpeechRecognition));
+  }
+
+  function startRecognition() {
+    if (!browserSupportsSpeechRecognition()) {
+      setStatus("SpeechRecognition not supported in this browser.");
+      return;
+    }
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let rec;
+    try {
+      rec = new SpeechRecognition();
+    } catch (e) {
+      console.error('Failed to construct SpeechRecognition', e);
+      setStatus('SpeechRecognition unavailable');
+      return;
+    }
+
+    rec.continuous = true;
+    rec.interimResults = false; // we count final results only to avoid duplicates
+    rec.lang = "en-US"; // you can expose this as a setting
+
+    rec.onstart = () => {
+      setStatus("Listening (speech recognition started)");
+      setListening(true);
+    };
+
+    rec.onerror = (e) => {
+      console.error('SpeechRecognition error', e);
+      // Provide a clear status for common errors
+      const errMsg = (e && (e.error || e.message)) || 'unknown';
+      setStatus('SpeechRecognition error: ' + errMsg);
+      // If permission denied or not allowed, stop the recognition and mic to avoid loops
+      if (e && (e.error === 'not-allowed' || e.error === 'permission-denied')) {
+        stopRecognition();
+        stopMic();
+        setMicPermission('denied');
+      }
+    };
+
+    rec.onend = () => {
+      setStatus("Speech recognition stopped");
+      setListening(false);
+      // try to restart automatically if mic is still allowed
+      if (mediaStreamRef.current) {
+        setTimeout(() => {
+          try { rec.start(); } catch (e) { console.warn('restart failed', e); }
+        }, 500);
+      }
+    };
+
+    rec.onresult = (evt) => {
+      // Use latest values from refs to avoid stale closures
+      const currentEnrolled = enrolledRef.current;
+      const currentVerified = verifiedRef.current;
+
+      for (let i = evt.resultIndex; i < evt.results.length; i++) {
+        const res = evt.results[i];
+        const text = (res[0] && res[0].transcript) ? res[0].transcript.trim() : "";
+        const isFinal = res.isFinal;
+        if (!isFinal) continue;
+        // Only count on final results to reduce duplicates
+        // If the transcript equals last one, skip to avoid double count
+        if (text === lastTranscriptRef.current) return;
+        lastTranscriptRef.current = text;
+
+        // simple word-based counting — count occurrences of 'sorry' case-insensitive
+        const matches = text.toLowerCase().match(/sorry/g);
+        const found = matches ? matches.length : 0;
+
+        // only increment if we have verification (speaker matched) OR if no enrollment is used
+        if (currentEnrolled) {
+          if (currentVerified) {
+            if (found > 0) setCount((c) => c + found);
+          } else {
+            console.log('Detected "sorry" but speaker not verified — ignored');
+          }
+        } else {
+          // no enrollment — accept everyone's "sorry"
+          if (found > 0) setCount((c) => c + found);
+        }
+      }
+    };
+
+    recognitionRef.current = rec;
+
+    try {
+      rec.start();
+    } catch (e) {
+      console.error('rec.start error', e);
+      setStatus('Failed to start speech recognition: ' + (e && e.message));
+    }
+  }
+
+  function stopRecognition() {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.onend = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.stop();
+      } catch (e) { console.warn('stopRecognition error', e); }
+      recognitionRef.current = null;
+    }
+    setListening(false);
+  }
+
+  // Public controls
+  async function handleStart() {
+    setStatus("Starting microphone and speech recognition...");
+    const micOk = await startMic();
+    if (!micOk) return;
+    // only start verification loop if enrollment exists
+    if (enrolVectorRef.current) startVerificationLoop();
+    // start speech recognition only if browser supports it
+    if (!browserSupportsSpeechRecognition()) {
+      setStatus('SpeechRecognition not supported — app will still count if you press the simulate buttons');
+      return;
+    }
+    startRecognition();
+    setStatus("Running — mic and speech recognition active");
+  }
+
+  function handleStop() {
+    setStatus("Stopping...");
+    stopRecognition();
+    stopMic();
+    try { cancelAnimationFrame(rafRef.current || 0); } catch (e) {}
+    setVerified(false);
+    setListening(false);
+    setStatus("Stopped");
+  }
+
+  async function handleEnroll() {
+    const ok = await enrollSample(3000);
+    if (ok) {
+      setEnrollStatus('Enrolled — you can now start the listener to require speaker verification.');
+      // start verification loop so similarity updates appear
+      startVerificationLoop();
+    }
+  }
+
+  function handleClearEnrollment() {
+    enrolVectorRef.current = null;
+    setEnrolled(false);
+    setEnrollStatus('Not enrolled');
+    setSimilarity(0);
+    setVerified(false);
+  }
+
+  function handleResetCount() {
+    setCount(0);
+    try { localStorage.setItem(getDateKey(), '0'); } catch (e) {}
+  }
+
+  // --- Debug/test helpers (useful as test cases when developing locally) ---
+  // Simulate a speech result containing "sorry".
+  function simulateSpeechResult(text) {
+    // mimic the action taken in rec.onresult
+    const normalized = (text || "").trim();
+    if (normalized === "") return;
+    const matches = normalized.toLowerCase().match(/sorry/g);
+    const found = matches ? matches.length : 0;
+    if (enrolledRef.current) {
+      if (verifiedRef.current) {
+        if (found > 0) setCount((c) => c + found);
+      } else {
+        console.log('Simulated: detected "sorry" but speaker not verified — ignored');
+      }
+    } else {
+      if (found > 0) setCount((c) => c + found);
+    }
+  }
+
+  // Helpers for UI guidance when mic permission denied
+  function renderPermissionInstructions() {
+    if (micPermission === 'granted') return null;
+    return (
+      <div className="mb-4 p-3 border rounded bg-yellow-50">
+        <strong>Microphone permission:</strong>
+        <div className="mt-1">Current permission status: <span className="font-mono">{micPermission}</span></div>
+        {micPermission === 'denied' && (
+          <div className="mt-2 text-sm">
+            It looks like microphone access was blocked. To enable it:
+            <ul className="list-disc ml-6 mt-1 text-sm">
+              <li>Click the lock icon near the browser address bar and allow microphone access for this site.</li>
+              <li>Or open your browser Settings → Privacy & Security → Site Settings → Microphone and allow this site.</li>
+              <li>After enabling, refresh the page and press <em>Start Listening</em>.</li>
+            </ul>
+          </div>
+        )}
+        {micPermission === 'prompt' && (
+          <div className="mt-2 text-sm">Your browser will ask for microphone permission when you press <em>Request Microphone Permission</em> below.</div>
+        )}
+        {micPermission === 'unknown' && (
+          <div className="mt-2 text-sm">Your browser does not expose microphone permission state. Press the button to request access, or use the simulate buttons below to test.</div>
+        )}
+        <div className="mt-3 flex gap-2">
+          <button onClick={() => { startMic(); checkMicPermission(); }} className="px-3 py-2 border rounded">Request Microphone Permission</button>
+          <button onClick={() => { checkMicPermission(); }} className="px-3 py-2 border rounded">Re-check Permission</button>
+        </div>
+      </div>
+    );
+  }
+
+  // Tiny UI
+  return (
+    <div className="max-w-xl mx-auto mt-8 p-6 rounded-2xl shadow-lg bg-white">
+      <h1 className="text-2xl font-bold mb-4">Sorry Counter</h1>
+      <p className="mb-4 text-sm text-gray-600">This app listens continuously (browser must allow microphone). It counts how many times you say "sorry" each day. Optionally enroll your voice to count only when it matches your voice (approximate matching).</p>
+
+      {renderPermissionInstructions()}
+
+      <div className="grid grid-cols-2 gap-3 mb-4">
+        <button onClick={handleStart} className="p-2 rounded-xl border hover:shadow">Start Listening</button>
+        <button onClick={handleStop} className="p-2 rounded-xl border hover:shadow">Stop</button>
+      </div>
+
+      <div className="mb-4">
+        <div className="flex items-center gap-4 mb-2">
+          <button onClick={handleEnroll} className="px-3 py-2 rounded-lg border">Enroll Voice (3s)</button>
+          <button onClick={handleClearEnrollment} className="px-3 py-2 rounded-lg border">Clear Enrollment</button>
+        </div>
+        <div className="text-sm text-gray-700">Enrollment: {enrollStatus}</div>
+      </div>
+
+      <div className="mb-4">
+        <div className="text-lg">Today's count: <span className="font-mono text-2xl">{count}</span></div>
+        <div className="mt-2 flex gap-2">
+          <button onClick={handleResetCount} className="px-2 py-1 border rounded">Reset Today</button>
+        </div>
+      </div>
+
+      <div className="mb-4">
+        <div className="text-sm">Status: <span className="font-mono">{status}</span></div>
+        <div className="text-sm">Listening: {listening ? 'yes' : 'no'}</div>
+        <div className="text-sm">Enrolled: {enrolled ? 'yes' : 'no'}</div>
+        <div className="text-sm">Speaker verified: {enrolled ? (verified ? '✓' : '✗') : 'N/A (not using enrollment)'}</div>
+        <div className="text-sm">Similarity: {similarity.toFixed(3)}</div>
+      </div>
+
+      <div className="mb-4">
+        <strong>Debug / Test buttons</strong>
+        <div className="mt-2 flex gap-2">
+          <button onClick={() => simulateSpeechResult('Sorry about that')} className="px-3 py-2 border rounded">Simulate "Sorry about that"</button>
+          <button onClick={() => simulateSpeechResult('I am sorry sorry')} className="px-3 py-2 border rounded">Simulate "I am sorry sorry"</button>
+          <button onClick={() => { setVerified((v) => !v); }} className="px-3 py-2 border rounded">Toggle Verified ({verified ? 'on' : 'off'})</button>
+        </div>
+        <div className="text-xs text-gray-500 mt-2">Use the simulate buttons when testing in browsers without SpeechRecognition or to reproduce behavior without access to a microphone.</div>
+      </div>
+
+      <div className="text-xs text-gray-500">
+        <strong>Privacy & accuracy notes</strong>: The speaker-recognition here is a simple browser-side spectral fingerprint (not a production biometric). It is approximate and can be fooled by noise or other speakers. Audio never leaves your browser in this implementation. For robust, secure speaker ID you'd want a server-side model and strong privacy controls.
+      </div>
+    </div>
+  );
+}
